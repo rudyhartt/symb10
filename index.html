@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="color-scheme" content="dark">
+  <title>SYMB10</title>
+
+  <!-- Keep favicon.png and hero.jpg in the same folder as this file. -->
+  <link rel="icon" type="image/png" sizes="64x64" href="./favicon.png">
+
+  <style>
+    :root {
+      /* A 2.5% opacity change, with no zoom or change in image height. */
+      --pulse-min: 0.975;
+      --pulse-duration: 14s;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background: #000;
+    }
+
+    body {
+      position: fixed;
+      inset: 0;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      /* Do not disable browser magnification for accessibility. */
+      touch-action: pinch-zoom;
+    }
+
+    .stage {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100vh; /* Fallback for older browsers. */
+      height: 100dvh;
+      overflow: hidden;
+      isolation: isolate;
+      background: #000;
+    }
+
+    /* Clipping, rather than a hidden scroll container, where supported. */
+    @supports (overflow: clip) {
+      html, body, .stage { overflow: clip; }
+    }
+
+    .hero {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      display: block;
+      width: auto;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      -webkit-user-drag: none;
+      -webkit-touch-callout: none;
+      user-select: none;
+      animation: breathe var(--pulse-duration) ease-in-out infinite;
+    }
+
+    .clouds {
+      position: absolute;
+      z-index: 1;
+      /* Overscan keeps blurred canvas edges outside the visible frame. */
+      top: -24px;
+      left: -24px;
+      width: calc(100% + 48px);
+      height: calc(100% + 48px);
+      display: block;
+      filter: blur(10px);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 3s ease;
+    }
+
+    .stage.is-ready .clouds { opacity: 1; }
+    .stage.is-paused .hero { animation-play-state: paused; }
+    .stage.is-missing .hero { visibility: hidden; }
+
+    @keyframes breathe {
+      0%, 100% { opacity: var(--pulse-min); }
+      50% { opacity: 1; }
+    }
+
+    /* This message is visible ONLY if the supplied image cannot load. */
+    .asset-notice {
+      position: absolute;
+      z-index: 2;
+      inset: 0;
+      display: grid;
+      place-content: center;
+      gap: 14px;
+      margin: 0;
+      padding: 32px;
+      color: #888;
+      text-align: center;
+      font: 13px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .asset-notice strong {
+      color: #e9e9e9;
+      font-size: 22px;
+      font-weight: 400;
+      letter-spacing: 0.22em;
+    }
+    [hidden] { display: none !important; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .hero { animation: none; opacity: 1; }
+      .clouds { display: none; transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage" id="stage" aria-label="SYMB10">
+    <!-- Change src if your image has a different filename or extension.
+         Replace alt with a useful description of your actual artwork. -->
+    <img
+      class="hero"
+      id="hero"
+      src="./SWC.png"
+      width="3344"
+      height="1882"
+      alt="SYMB10 artwork"
+      draggable="false"
+      decoding="async"
+      fetchpriority="high"
+    >
+    <canvas class="clouds" id="clouds" aria-hidden="true"></canvas>
+    <p class="asset-notice" id="asset-notice" role="status" hidden>
+      <strong>SYMB10</strong>
+      <span>Place your image in this folder as <b>hero.jpg</b>.</span>
+    </p>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      /* -----------------------------------------------------------
+         EFFECT SETTINGS — edit these to tune the atmosphere.
+         Black, soft-edged cloud veils hide and reveal the image.
+         This is procedural layered noise, not a repeating video.
+         ----------------------------------------------------------- */
+      const CLOUD = {
+        enabled: true,
+        strength: 0.70,   // 0 = invisible; 1 = deepest areas can be black.
+        speed: 0.023,     // Smaller = slower drift. Try 0.012 for very slow.
+        scale: 2.4,       // Smaller = broader clouds; larger = finer clouds.
+        fps: 20,          // Slow motion does not need 60 canvas updates/sec.
+        resolution: 240  // Long edge of the soft, low-resolution cloud map.
+      };
+
+      const stage = document.getElementById("stage");
+      const hero = document.getElementById("hero");
+      const canvas = document.getElementById("clouds");
+      const notice = document.getElementById("asset-notice");
+      const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+      const context = canvas.getContext("2d", { alpha: true });
+
+      /* Discourage casual copying. This is NOT DRM: screenshots,
+         developer tools, direct URLs and browser menus remain possible.
+         No developer-tools blocking and no keyboard-zoom blocking. */
+      const prevent = event => event.preventDefault();
+      for (const type of ["contextmenu", "dragstart", "dragover", "drop", "selectstart"]) {
+        document.addEventListener(type, prevent, { capture: true });
+      }
+      document.addEventListener("keydown", event => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+          event.preventDefault();
+        }
+      });
+
+      let imageReady = false;
+      let frameId = 0;
+      let previousFrame = null;
+      let elapsed = 0;
+      let pixels = null;
+      let width = 0;
+      let height = 0;
+      let pageIsLeaving = false;
+      const interval = 1000 / Math.max(1, Math.min(60, CLOUD.fps));
+      const strength = Math.max(0, Math.min(1, CLOUD.strength));
+
+      /* Seeded lookup values make the cloud field stable from frame to
+         frame. Four rotated octaves create the Photoshop-like texture. */
+      const randomValues = new Float32Array(256 * 256);
+      let seed = 0x51b10;
+      for (let i = 0; i < randomValues.length; i++) {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        randomValues[i] = (seed >>> 0) / 4294967296;
+      }
+
+      const mix = (a, b, t) => a + (b - a) * t;
+      const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+      const smoothstep = (low, high, value) => {
+        const t = Math.max(0, Math.min(1, (value - low) / (high - low)));
+        return t * t * (3 - 2 * t);
+      };
+
+      function noise(x, y) {
+        const ix = Math.floor(x);
+        const iy = Math.floor(y);
+        const tx = fade(x - ix);
+        const ty = fade(y - iy);
+        const x0 = ix & 255;
+        const x1 = (ix + 1) & 255;
+        const row0 = (iy & 255) << 8;
+        const row1 = ((iy + 1) & 255) << 8;
+        return mix(
+          mix(randomValues[row0 + x0], randomValues[row0 + x1], tx),
+          mix(randomValues[row1 + x0], randomValues[row1 + x1], tx),
+          ty
+        );
+      }
+
+      function fractalNoise(x, y) {
+        let value = 0;
+        let weight = 8 / 15;
+        for (let octave = 0; octave < 4; octave++) {
+          value += noise(x, y) * weight;
+          // Rotate each octave to avoid a visible square/grid structure.
+          const nextX = x * 1.6 - y * 1.2 + 19.1;
+          y = x * 1.2 + y * 1.6 + 7.7;
+          x = nextX;
+          weight *= 0.5;
+        }
+        return value;
+      }
+
+      function draw(seconds) {
+        if (!context || !pixels) return;
+        const drift = seconds * CLOUD.speed;
+        const unit = CLOUD.scale / Math.min(width, height);
+        const data = pixels.data;
+
+        for (let y = 0; y < height; y++) {
+          const py = (y - height / 2) * unit + 27.8;
+          for (let x = 0; x < width; x++) {
+            const px = (x - width / 2) * unit + 11.4;
+            // Independent, slowly evolving warps produce asymmetry.
+            const warpX = noise(px * 0.64 + drift * 0.19, py * 0.64 + 63.2) - 0.5;
+            const warpY = noise(px * 0.64 + 41.7, py * 0.64 - drift * 0.23) - 0.5;
+            const value = fractalNoise(
+              px + warpX * 1.6 - drift,
+              py + warpY * 1.6 + drift * 0.31
+            );
+            const density = smoothstep(0.32, 0.72, value);
+            // RGB stays black. Transparent regions reveal the artwork;
+            // dark regions blend into the page's black background.
+            data[(y * width + x) * 4 + 3] = Math.round(density * strength * 255);
+          }
+        }
+        context.putImageData(pixels, 0, 0);
+      }
+
+      function resize() {
+        if (!context || !CLOUD.enabled) return;
+        const bounds = canvas.getBoundingClientRect();
+        if (bounds.width <= 0 || bounds.height <= 0) return;
+        const factor = Math.min(1, Math.max(32, CLOUD.resolution) / Math.max(bounds.width, bounds.height));
+        const nextWidth = Math.max(1, Math.round(bounds.width * factor));
+        const nextHeight = Math.max(1, Math.round(bounds.height * factor));
+        if (nextWidth === width && nextHeight === height) return;
+        width = canvas.width = nextWidth;
+        height = canvas.height = nextHeight;
+        pixels = context.createImageData(width, height);
+        if (imageReady && !motion.matches) draw(elapsed);
+      }
+
+      function animate(now) {
+        if (previousFrame === null || now - previousFrame >= interval - 0.5) {
+          if (previousFrame !== null) {
+            elapsed += Math.min((now - previousFrame) / 1000, 0.25);
+          }
+          previousFrame = now;
+          draw(elapsed);
+        }
+        frameId = window.requestAnimationFrame(animate);
+      }
+
+      function syncMotion() {
+        window.cancelAnimationFrame(frameId);
+        frameId = 0;
+        previousFrame = null;
+        const paused = document.hidden || motion.matches || pageIsLeaving;
+        stage.classList.toggle("is-paused", paused);
+        if (paused || !imageReady || !context || !CLOUD.enabled) return;
+        resize();
+        draw(elapsed);
+        frameId = window.requestAnimationFrame(animate);
+      }
+
+      function setImageState(success) {
+        imageReady = success;
+        notice.hidden = success;
+        stage.classList.toggle("is-ready", success);
+        stage.classList.toggle("is-missing", !success);
+        syncMotion();
+      }
+
+      hero.addEventListener("load", () => setImageState(true));
+      hero.addEventListener("error", () => setImageState(false));
+      if (hero.complete) setImageState(hero.naturalWidth > 0);
+
+      window.addEventListener("resize", resize, { passive: true });
+      if ("ResizeObserver" in window) {
+        new ResizeObserver(resize).observe(stage);
+      }
+      document.addEventListener("visibilitychange", syncMotion);
+      if (motion.addEventListener) motion.addEventListener("change", syncMotion);
+      else motion.addListener(syncMotion);
+
+      window.addEventListener("pagehide", () => {
+        pageIsLeaving = true;
+        syncMotion();
+      });
+      window.addEventListener("pageshow", () => {
+        pageIsLeaving = false;
+        syncMotion();
+      });
+    })();
+  </script>
+</body>
+</html>
